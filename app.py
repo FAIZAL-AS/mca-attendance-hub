@@ -1,443 +1,642 @@
-import os
-import io
-import csv
-import re
 import datetime
+import hmac
+import io
+import json
+import os
+import re
+
 import pandas as pd
 import streamlit as st
 
-# ==================== CONFIG & PATHS ====================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STUDENTS_FILE = os.path.join(BASE_DIR, "students.csv")
 ATTENDANCE_FILE = os.path.join(BASE_DIR, "attendance_records.csv")
+AUDIT_FILE = os.path.join(BASE_DIR, "faculty_activity.csv")
+AUDIT_COLUMNS = [
+    "timestamp", "faculty_id", "action", "date", "section",
+    "reg_no", "student_name", "old_value", "new_value",
+]
+ATTENDANCE_COLUMNS = [
+    "date", "month", "reg_no", "name", "section", "status", "marked_by", "timestamp"
+]
+ROSTER_COLUMNS = ["sno", "reg_no", "name", "course", "section"]
+FACULTY_IDS = [f"Faculty-{i}" for i in range(1, 11)]
+APP_TIMEZONE = datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
 
 st.set_page_config(
-    page_title="MCA Attendance & Absentees Hub",
+    page_title="MCA Attendance Hub",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom minimal styling
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 8px;
-        padding: 12px 16px;
-        border-left: 4px solid #1E88E5;
-        margin-bottom: 8px;
-    }
-    .low-att {
-        color: #d32f2f;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.8rem; }
+    [data-testid="stMetric"] { background: #f5f7fb; padding: 0.8rem; border-radius: 0.7rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# ==================== DATA ACCESS LAYER ====================
+def shared_password():
+    """Read the shared password from Streamlit Secrets (or an environment variable locally)."""
+    try:
+        configured = st.secrets.get("FACULTY_SHARED_PASSWORD", "")
+    except Exception:
+        configured = ""
+    return str(configured or os.environ.get("FACULTY_SHARED_PASSWORD", ""))
+
+
+def login_gate() -> bool:
+    password = shared_password()
+    if not password:
+        st.title("MCA Attendance Hub")
+        st.error("Faculty login is not configured yet.")
+        st.markdown(
+            "In Streamlit hosting, add `FACULTY_SHARED_PASSWORD` under **App settings → Secrets**. "
+            "For local use, set the same environment variable before starting the app."
+        )
+        st.code('FACULTY_SHARED_PASSWORD = "choose-a-shared-password"', language="toml")
+        return False
+
+    if st.session_state.get("faculty_id") not in FACULTY_IDS:
+        st.title("MCA Attendance Hub")
+        st.caption("Sign in with your faculty ID. Faculty IDs share the password configured by the administrator.")
+        with st.form("faculty_login"):
+            faculty_id = st.selectbox("Faculty ID", FACULTY_IDS)
+            entered_password = st.text_input("Shared password", type="password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            if hmac.compare_digest(entered_password, password):
+                st.session_state["faculty_id"] = faculty_id
+                st.rerun()
+            st.error("The password did not match. Please try again.")
+        return False
+    return True
+
+
 def parse_flexible_csv(file_content: str) -> pd.DataFrame:
-    """Robust parser that handles irregular commas and header noise."""
+    """Read the roster's older comma-separated format, including trailing fields."""
     rows = []
-    lines = file_content.strip().splitlines()
-    for line in lines:
-        parts = [p.strip() for p in line.split(",") if p.strip()]
+    for line in file_content.strip().splitlines():
+        parts = [part.strip() for part in line.split(",") if part.strip()]
         if len(parts) >= 5 and parts[1].upper().startswith("RTC2026"):
-            sno = parts[0]
-            reg = parts[1]
-            name = parts[2]
-            course = parts[3]
-            sec = parts[4].upper()
-            if sec not in ["A", "B"]:
-                sec = "A" if "A" in parts[4:] else "B"
+            section = parts[4].upper()
+            if section not in {"A", "B"}:
+                section = "A" if "A" in parts[4:] else "B"
             rows.append({
-                "sno": sno,
-                "reg_no": reg,
-                "name": name,
-                "course": course,
-                "section": sec
+                "sno": parts[0], "reg_no": parts[1], "name": parts[2],
+                "course": parts[3], "section": section,
             })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=ROSTER_COLUMNS)
 
 
 def load_students() -> pd.DataFrame:
-    if os.path.exists(STUDENTS_FILE):
-        try:
-            return pd.read_csv(STUDENTS_FILE)
-        except Exception:
-            with open(STUDENTS_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                return parse_flexible_csv(f.read())
-    return pd.DataFrame(columns=["sno", "reg_no", "name", "course", "section"])
+    if not os.path.exists(STUDENTS_FILE):
+        return pd.DataFrame(columns=ROSTER_COLUMNS)
+    try:
+        df = pd.read_csv(STUDENTS_FILE, dtype={"reg_no": str})
+        for col in ROSTER_COLUMNS:
+            if col not in df.columns:
+                df[col] = "" if col != "sno" else range(1, len(df) + 1)
+        df = df[ROSTER_COLUMNS].fillna("")
+        df["reg_no"] = df["reg_no"].astype(str).str.strip()
+        df["section"] = df["section"].astype(str).str.upper().str.strip()
+        return df
+    except Exception:
+        with open(STUDENTS_FILE, "r", encoding="utf-8-sig", errors="ignore") as roster_file:
+            return parse_flexible_csv(roster_file.read())
 
 
 def load_attendance() -> pd.DataFrame:
     if not os.path.exists(ATTENDANCE_FILE):
-        df = pd.DataFrame(columns=[
-            "date", "month", "reg_no", "name", "section", "status", "marked_by", "timestamp"
-        ])
-        df.to_csv(ATTENDANCE_FILE, index=False)
-        return df
+        return pd.DataFrame(columns=ATTENDANCE_COLUMNS)
     try:
-        df = pd.read_csv(ATTENDANCE_FILE)
-        if "month" not in df.columns and not df.empty and "date" in df.columns:
-            df["month"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m")
-        return df
+        df = pd.read_csv(ATTENDANCE_FILE, dtype={"reg_no": str})
+        for col in ATTENDANCE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df["date"] = df["date"].astype(str)
+        if "month" in df.columns:
+            missing_month = df["month"].astype(str).isin(["", "nan"])
+            df.loc[missing_month, "month"] = df.loc[missing_month, "date"].str[:7]
+        return df[ATTENDANCE_COLUMNS].fillna("")
     except Exception:
-        return pd.DataFrame(columns=[
-            "date", "month", "reg_no", "name", "section", "status", "marked_by", "timestamp"
-        ])
+        return pd.DataFrame(columns=ATTENDANCE_COLUMNS)
 
 
-def save_attendance(new_records_df: pd.DataFrame, date_str: str, section: str):
+def load_audit() -> pd.DataFrame:
+    if not os.path.exists(AUDIT_FILE):
+        return pd.DataFrame(columns=AUDIT_COLUMNS)
+    try:
+        df = pd.read_csv(AUDIT_FILE, keep_default_na=False)
+        for col in AUDIT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[AUDIT_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=AUDIT_COLUMNS)
+
+
+def append_audit(entries):
+    if not entries:
+        return
+    audit_df = pd.DataFrame(entries, columns=AUDIT_COLUMNS)
+    write_header = not os.path.exists(AUDIT_FILE) or os.path.getsize(AUDIT_FILE) == 0
+    audit_df.to_csv(AUDIT_FILE, mode="a", index=False, header=write_header)
+
+
+def save_attendance(records: pd.DataFrame, date_str: str, section: str, faculty_id: str):
     current = load_attendance()
-    # Remove existing entries for this specific date and section to allow clean overwrites/edits
-    if not current.empty:
-        mask = (current["date"] == date_str) & (current["section"] == section)
-        current = current[~mask]
-    
-    updated = pd.concat([current, new_records_df], ignore_index=True)
-    updated.to_csv(ATTENDANCE_FILE, index=False)
+    if current.empty:
+        old_rows = pd.DataFrame(columns=ATTENDANCE_COLUMNS)
+    else:
+        old_rows = current[(current["date"] == date_str) & (current["section"] == section)]
+    old_by_reg = {str(row["reg_no"]): row for _, row in old_rows.iterrows()}
 
+    now = datetime.datetime.now(APP_TIMEZONE).isoformat(timespec="seconds")
+    records = records.copy()
+    records["date"] = date_str
+    records["month"] = date_str[:7]
+    records["section"] = section
+    records["marked_by"] = faculty_id
+    records["timestamp"] = now
+    records = records[ATTENDANCE_COLUMNS]
 
-# ==================== LIGHTWEIGHT CHATBOT ENGINE ====================
-def query_assistant(user_prompt: str, att_df: pd.DataFrame, students_df: pd.DataFrame, api_key: str = None) -> str:
-    """Lightweight rule-based NLP matcher first; Gemini Flash fallback if API key given."""
-    q = user_prompt.strip().lower()
-
-    if att_df.empty:
-        return "No attendance has been recorded yet. Please mark attendance first."
-
-    # Pattern 1: Today's absentees
-    if any(k in q for k in ["today", "current day"]):
-        today_s = datetime.date.today().strftime("%Y-%m-%d")
-        sub = att_df[(att_df["date"] == today_s) & (att_df["status"] == "Absent")]
-        if sub.empty:
-            return f"No absentees recorded for today ({today_s}). Everyone present or attendance not yet marked."
-        return f"**Absentees Today ({today_s}):**\n" + "\n".join([f"- {r['reg_no']} : {r['name']} (Sec {r['section']})" for _, r in sub.iterrows()])
-
-    # Pattern 2: Specific date absentees (YYYY-MM-DD or DD-MM-YYYY)
-    date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", q)
-    if not date_match:
-        date_match = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b", q)
-    if date_match:
-        target_date = date_match.group(1).replace("/", "-")
-        # Normalize date
-        try:
-            target_date = pd.to_datetime(target_date).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-        sub = att_df[(att_df["date"] == target_date) & (att_df["status"] == "Absent")]
-        if sub.empty:
-            return f"No absentees found for date `{target_date}`."
-        return f"**Absentees on {target_date} ({len(sub)} students):**\n" + "\n".join([f"- {r['reg_no']} : {r['name']} (Sec {r['section']})" for _, r in sub.iterrows()])
-
-    # Pattern 3: Specific student inquiry by Reg No or Name
-    found_student = None
-    for _, s in students_df.iterrows():
-        if str(s["reg_no"]).lower() in q or (len(str(s["name"])) > 3 and str(s["name"]).lower() in q):
-            found_student = s
-            break
-
-    if found_student is not None:
-        reg = found_student["reg_no"]
-        name = found_student["name"]
-        st_records = att_df[att_df["reg_no"] == reg]
-        if st_records.empty:
-            return f"Student **{name}** ({reg}) exists in roster, but no attendance recorded yet."
-        total_days = st_records["date"].nunique()
-        absent_days = len(st_records[st_records["status"] == "Absent"])
-        present_days = total_days - absent_days
-        pct = (present_days / total_days * 100) if total_days > 0 else 0
-        
-        absent_dates = st_records[st_records["status"] == "Absent"]["date"].tolist()
-        dates_msg = f"\n*Dates absent:* {', '.join(absent_dates)}" if absent_dates else "\n*Perfect attendance so far!*"
-        return f"**Attendance Report for {name} ({reg}) - Sec {found_student['section']}:**\n- Total Classes: {total_days}\n- Present: {present_days}\n- Absent: {absent_days}\n- Attendance Percentage: **{pct:.1f}%**{dates_msg}"
-
-    # Pattern 4: Low attendance / Below 75%
-    if any(k in q for k in ["shortage", "below 75", "low attendance", "defaulters"]):
-        student_counts = att_df.groupby(["reg_no", "name", "section", "status"]).size().unstack(fill_value=0)
-        if "Absent" not in student_counts.columns:
-            return "No absentees on record yet."
-        student_counts["Total"] = student_counts.sum(axis=1)
-        student_counts["Percentage"] = (student_counts.get("Present", 0) / student_counts["Total"]) * 100
-        low = student_counts[student_counts["Percentage"] < 75].reset_index()
-        if low.empty:
-            return "Great news: No students are currently below 75% attendance threshold!"
-        lines = [f"- {r['name']} ({r['reg_no']}) - Sec {r['section']} : **{r['Percentage']:.1f}%** ({r['Absent']} days absent)" for _, r in low.iterrows()]
-        return f"**Students with Attendance Shortage (<75%):**\n" + "\n".join(lines)
-
-    # Pattern 5: Most absent / top absentees
-    if any(k in q for k in ["most absent", "top absent", "highest absent", "frequent"]):
-        abs_grp = att_df[att_df["status"] == "Absent"].groupby(["reg_no", "name", "section"]).size().reset_index(name="Days")
-        abs_grp = abs_grp.sort_values(by="Days", ascending=False).head(10)
-        if abs_grp.empty:
-            return "No absences recorded yet."
-        lines = [f"- {r['name']} ({r['reg_no']}, Sec {r['section']}): **{r['Days']} days**" for _, r in abs_grp.iterrows()]
-        return "**Top Frequent Absentees:**\n" + "\n".join(lines)
-
-    # Fallback to Gemini Flash if API Key provided
-    if api_key:
-        try:
-            import urllib.request
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            summary_csv = att_df[["date", "reg_no", "name", "section", "status"]].tail(100).to_csv(index=False)
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": f"You are a helpful college attendance assistant. Answer using this CSV data:\n\n{summary_csv}\n\nQuestion: {user_prompt}\nKeep answers clear, polite and concise."
-                    }]
-                }]
-            }
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                res_data = json.loads(resp.read().decode())
-                return res_data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            return f"Lightweight NLP could not match question. (Gemini API error: {e})"
-
-    return "I can answer questions like:\n- *'Who is absent today?'*\n- *'Who was absent on 2026-10-31?'*\n- *'Show attendance of Adheeswaran'* or *'RTC2026MCA024'*\n- *'Who has low attendance / below 75%'*\n- *'Who are the most absent students?'*"
-
-
-# ==================== MAIN APPLICATION UI ====================
-def main():
-    students_df = load_students()
-    att_df = load_attendance()
-
-    # Sidebar: Staff profile & Quick stats
-    st.sidebar.title("📌 Staff Portal")
-    staff_id = st.sidebar.text_input("Staff Name / ID", value="Faculty-1")
-    
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Live Roster Status")
-    st.sidebar.write(f"Total Enrolled: **{len(students_df)}**")
-    sec_a_count = len(students_df[students_df["section"] == "A"])
-    sec_b_count = len(students_df[students_df["section"] == "B"])
-    st.sidebar.write(f"- Section A: **{sec_a_count}** students")
-    st.sidebar.write(f"- Section B: **{sec_b_count}** students")
-    st.sidebar.write(f"Attendance Records: **{len(att_df)}** entries")
-
-    if st.sidebar.button("🔄 Sync / Refresh"):
-        st.cache_data.clear()
-        st.rerun()
-
-    # Tabs
-    tab_mark, tab_analytics, tab_chat, tab_manage = st.tabs([
-        "✏️ Mark / Edit Attendance",
-        "📊 Monthly Absentees & Reports",
-        "💬 Attendance Chatbot",
-        "⚙️ Manage Roster"
-    ])
-
-    # ---------------- TAB 1: MARK ATTENDANCE ----------------
-    with tab_mark:
-        st.subheader("Mark or Update Daily Attendance")
-        c1, c2, c3 = st.columns([2, 2, 2])
-        with c1:
-            chosen_date = st.date_input("Select Date", datetime.date.today())
-            date_str = chosen_date.strftime("%Y-%m-%d")
-            month_str = chosen_date.strftime("%Y-%m")
-        with c2:
-            chosen_sec = st.selectbox("Select Section", ["A", "B"])
-        with c3:
-            st.write("")
-            st.write(f"**Date:** `{date_str}` | **Section:** `{chosen_sec}`")
-
-        sec_students = students_df[students_df["section"] == chosen_sec].copy()
-        if sec_students.empty:
-            st.warning(f"No students found in Section {chosen_sec}. Check 'Manage Roster' tab.")
-        else:
-            # Check existing marks for this date & section
-            existing_records = att_df[(att_df["date"] == date_str) & (att_df["section"] == chosen_sec)]
-            is_already_marked = not existing_records.empty
-
-            if is_already_marked:
-                marked_by_info = existing_records["marked_by"].iloc[0] if "marked_by" in existing_records.columns else "Unknown"
-                last_time = existing_records["timestamp"].iloc[0] if "timestamp" in existing_records.columns else ""
-                st.info(f"ℹ️ Attendance for **Section {chosen_sec}** on **{date_str}** was already marked by **{marked_by_info}** at {last_time}. You can edit and save changes below.")
-                status_dict = dict(zip(existing_records["reg_no"], existing_records["status"]))
-                sec_students["is_absent"] = sec_students["reg_no"].map(lambda r: status_dict.get(r, "Present") == "Absent")
-            else:
-                st.success(f"New attendance sheet for **Section {chosen_sec}** on **{date_str}**.")
-                sec_students["is_absent"] = False
-
-            # Display interactive table with checkboxes
-            sec_students = sec_students.sort_values(by="reg_no").reset_index(drop=True)
-            
-            st.caption("Check the box to mark a student **ABSENT** (Unchecked = Present). Changes sync instantly across all staff.")
-            
-            # Data editor
-            display_df = pd.DataFrame({
-                "S.No": range(1, len(sec_students) + 1),
-                "Reg No": sec_students["reg_no"],
-                "Name": sec_students["name"],
-                "Absent?": sec_students["is_absent"]
+    audit_entries = []
+    new_regs = set(records["reg_no"].astype(str))
+    for _, row in records.iterrows():
+        reg_no = str(row["reg_no"])
+        old = old_by_reg.get(reg_no)
+        old_status = str(old["status"]) if old is not None else "Not recorded"
+        new_status = str(row["status"])
+        old_name = str(old["name"]) if old is not None else ""
+        if old_status != new_status or old_name != str(row["name"]):
+            audit_entries.append({
+                "timestamp": now, "faculty_id": faculty_id,
+                "action": "Attendance added" if old is None else "Attendance updated",
+                "date": date_str, "section": section, "reg_no": reg_no,
+                "student_name": row["name"],
+                "old_value": old_status if old_name == str(row["name"]) else f"{old_name} / {old_status}",
+                "new_value": new_status if old_name == str(row["name"]) else f"{row['name']} / {new_status}",
+            })
+    for reg_no, old in old_by_reg.items():
+        if reg_no not in new_regs:
+            audit_entries.append({
+                "timestamp": now, "faculty_id": faculty_id, "action": "Attendance row removed",
+                "date": date_str, "section": section, "reg_no": reg_no,
+                "student_name": old["name"], "old_value": old["status"], "new_value": "Removed",
             })
 
-            edited_data = st.data_editor(
-                display_df,
-                column_config={
-                    "Absent?": st.column_config.CheckboxColumn("Mark Absent", default=False),
-                    "S.No": st.column_config.NumberColumn(width="small"),
-                    "Reg No": st.column_config.TextColumn(disabled=True),
-                    "Name": st.column_config.TextColumn(disabled=True)
-                },
-                disabled=["S.No", "Reg No", "Name"],
-                hide_index=True,
-                use_container_width=True,
-                key=f"editor_{date_str}_{chosen_sec}"
-            )
+    if not current.empty:
+        current = current[~((current["date"] == date_str) & (current["section"] == section))]
+    pd.concat([current, records], ignore_index=True).to_csv(ATTENDANCE_FILE, index=False)
+    append_audit(audit_entries)
 
-            col_btn1, col_btn2 = st.columns([2, 4])
-            with col_btn1:
-                if st.button("💾 Submit & Sync Attendance", type="primary", use_container_width=True):
-                    now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    new_rows = []
-                    for _, r in edited_data.iterrows():
-                        status = "Absent" if r["Absent?"] else "Present"
-                        new_rows.append({
-                            "date": date_str,
-                            "month": month_str,
-                            "reg_no": r["Reg No"],
-                            "name": r["Name"],
-                            "section": chosen_sec,
-                            "status": status,
-                            "marked_by": staff_id,
-                            "timestamp": now_ts
-                        })
-                    save_attendance(pd.DataFrame(new_rows), date_str, chosen_sec)
-                    abs_count = sum(edited_data["Absent?"])
-                    st.success(f"✅ Successfully saved {chosen_sec} for {date_str}! Total Absentees: {abs_count}")
-                    st.rerun()
 
-    # ---------------- TAB 2: MONTHLY ABSENTEES & REPORTS ----------------
-    with tab_analytics:
-        st.subheader("Monthly Absentees & Attendance Analysis")
-        if att_df.empty:
+def validate_roster(roster: pd.DataFrame):
+    roster = roster[ROSTER_COLUMNS].copy().fillna("")
+    for col in ROSTER_COLUMNS:
+        roster[col] = roster[col].astype(str).str.strip()
+    roster["section"] = roster["section"].str.upper()
+    if (roster["reg_no"] == "").any() or (roster["name"] == "").any():
+        return None, "Every student needs a registration number and name."
+    if roster["reg_no"].duplicated().any():
+        return None, "Registration numbers must be unique."
+    if not roster["section"].isin(["A", "B"]).all():
+        return None, "Section must be A or B for every student."
+    roster["sno"] = range(1, len(roster) + 1)
+    return roster, ""
+
+
+def save_roster(roster: pd.DataFrame, faculty_id: str):
+    updated, error = validate_roster(roster)
+    if error:
+        return error
+    previous = load_students()
+    old = {str(r["reg_no"]): r for _, r in previous.iterrows()}
+    new = {str(r["reg_no"]): r for _, r in updated.iterrows()}
+    now = datetime.datetime.now(APP_TIMEZONE).isoformat(timespec="seconds")
+    changes = []
+    for reg_no, row in new.items():
+        before = old.get(reg_no)
+        old_value = "Not on roster" if before is None else json.dumps(before.to_dict(), ensure_ascii=False)
+        new_value = json.dumps(row.to_dict(), ensure_ascii=False)
+        if before is None or any(str(before[c]) != str(row[c]) for c in ROSTER_COLUMNS if c != "sno"):
+            changes.append({
+                "timestamp": now, "faculty_id": faculty_id,
+                "action": "Student added" if before is None else "Roster details updated",
+                "date": "", "section": row["section"], "reg_no": reg_no,
+                "student_name": row["name"], "old_value": old_value, "new_value": new_value,
+            })
+    for reg_no, row in old.items():
+        if reg_no not in new:
+            changes.append({
+                "timestamp": now, "faculty_id": faculty_id, "action": "Student removed",
+                "date": "", "section": row["section"], "reg_no": reg_no,
+                "student_name": row["name"], "old_value": json.dumps(row.to_dict(), ensure_ascii=False),
+                "new_value": "Removed from roster",
+            })
+    updated.to_csv(STUDENTS_FILE, index=False)
+    append_audit(changes)
+    return ""
+
+
+def parse_target_date(question: str):
+    q = question.lower()
+    today = datetime.datetime.now(APP_TIMEZONE).date()
+    if "yesterday" in q:
+        return (today - datetime.timedelta(days=1)).isoformat()
+    if "today" in q or "current day" in q:
+        return today.isoformat()
+    match = re.search(r"\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b", q)
+    if not match:
+        return None
+    try:
+        return pd.to_datetime(match.group(1), dayfirst="-" not in match.group(1)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def query_assistant(user_prompt: str, attendance: pd.DataFrame, students: pd.DataFrame) -> str:
+    """Answer common attendance questions from saved records without sending data outside the app."""
+    q = user_prompt.strip().lower()
+    if not q:
+        return "Ask about absentees, attendance percentages, a student, a section, or a date."
+    if attendance.empty:
+        return "No attendance has been recorded yet. Mark attendance first, then ask again."
+
+    date_filter = parse_target_date(q)
+    data = attendance.copy()
+    if date_filter:
+        data = data[data["date"] == date_filter]
+    else:
+        month_match = re.search(r"\b(20\d{2})[-/](0?[1-9]|1[0-2])\b", q)
+        if month_match:
+            month = f"{month_match.group(1)}-{int(month_match.group(2)):02d}"
+            data = data[data["date"].str.startswith(month)]
+
+    section_match = re.search(r"\bsection\s*([ab])\b|\bsec\s*([ab])\b", q)
+    requested_section = next((part.upper() for part in section_match.groups() if part), None) if section_match else None
+    if requested_section:
+        data = data[data["section"].astype(str).str.upper() == requested_section]
+
+    # Student-specific questions take precedence over general status queries.
+    student_matches = []
+    for _, student in students.iterrows():
+        reg_no = str(student.get("reg_no", "")).strip()
+        name = str(student.get("name", "")).strip()
+        if (reg_no and reg_no.lower() in q) or (len(name) > 2 and name.lower() in q):
+            student_matches.append(student)
+    if student_matches:
+        student = student_matches[0]
+        reg_no = str(student["reg_no"])
+        rows = attendance[attendance["reg_no"].astype(str) == reg_no]
+        if date_filter:
+            rows = rows[rows["date"] == date_filter]
+        if requested_section:
+            rows = rows[rows["section"].astype(str).str.upper() == requested_section]
+        if rows.empty:
+            return f"No attendance records found for {student['name']} ({reg_no}) in that period."
+        total = rows["date"].nunique()
+        present = int((rows["status"] == "Present").sum())
+        absent_rows = rows[rows["status"] == "Absent"]
+        pct = present / max(len(rows), 1) * 100
+        dates = ", ".join(absent_rows["date"].astype(str).tolist()) or "none"
+        period = date_filter or "the selected period"
+        if date_filter:
+            status = str(rows.iloc[-1]["status"])
+            return f"**{student['name']} ({reg_no})** — {status} on {date_filter}."
+        return (
+            f"**{student['name']} ({reg_no}) — Section {student['section']}**\n\n"
+            f"- Recorded class days: {total}\n- Present: {present}\n"
+            f"- Absent: {len(absent_rows)}\n- Attendance: **{pct:.1f}%**\n- Absent dates: {dates}"
+        )
+
+    if data.empty:
+        return f"No attendance entries found for {date_filter or 'that period'}" + (f" in Section {requested_section}." if requested_section else ".")
+
+    absent_terms = ("absent", "absence", "missed", "not present")
+    present_terms = ("present", "attended", "in class")
+    if any(term in q for term in absent_terms):
+        result = data[data["status"] == "Absent"]
+        label = "absent"
+    elif any(term in q for term in present_terms):
+        result = data[data["status"] == "Present"]
+        label = "present"
+    else:
+        result = pd.DataFrame()
+        label = ""
+
+    if label:
+        if any(term in q for term in ("how many", "count", "number of", "total")):
+            return f"There were **{len(result)} {label}** in {len(data['date'].unique())} recorded class day(s)."
+        if result.empty:
+            return f"No students were recorded as {label} for that period."
+        heading = f"{label.title()} students"
+        if date_filter:
+            heading += f" on {date_filter}"
+        if requested_section:
+            heading += f" in Section {requested_section}"
+        lines = [f"- {r['name']} ({r['reg_no']}) — Section {r['section']}" for _, r in result.iterrows()]
+        return f"**{heading} ({len(result)}):**\n" + "\n".join(lines)
+
+    if any(term in q for term in ("below", "shortage", "low attendance", "defaulter")):
+        threshold_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", q)
+        threshold = float(threshold_match.group(1)) if threshold_match else 75.0
+        grouped = data.groupby(["reg_no", "name", "section"])["status"].value_counts().unstack(fill_value=0)
+        present_counts = grouped.get("Present", pd.Series(0, index=grouped.index))
+        totals = grouped.sum(axis=1)
+        percentages = present_counts / totals.clip(lower=1) * 100
+        low = percentages[percentages < threshold].sort_values()
+        if low.empty:
+            return f"No students are below {threshold:g}% attendance in the selected period."
+        lines = [
+            f"- {idx[1]} ({idx[0]}, Section {idx[2]}): **{percentages.loc[idx]:.1f}%**"
+            for idx in low.index
+        ]
+        return f"**Below {threshold:g}% attendance ({len(lines)}):**\n" + "\n".join(lines)
+
+    if any(term in q for term in ("most absent", "top absentee", "frequent absence", "most absences")):
+        totals = data[data["status"] == "Absent"].groupby(["reg_no", "name", "section"]).size().sort_values(ascending=False).head(10)
+        if totals.empty:
+            return "No absences were recorded for that period."
+        return "**Most recorded absences:**\n" + "\n".join(
+            f"- {idx[1]} ({idx[0]}, Section {idx[2]}): {count} day(s)" for idx, count in totals.items()
+        )
+
+    days = ", ".join(sorted(data["date"].astype(str).unique()))
+    return (
+        f"I found {len(data)} attendance entries across {data['reg_no'].nunique()} students "
+        f"for {days}. Try asking who was absent, who was present, a student's attendance, "
+        "or who is below 75%."
+    )
+
+
+def render_attendance_editor(students: pd.DataFrame, attendance: pd.DataFrame, faculty_id: str):
+    st.subheader("Mark or edit daily attendance")
+    date_col, section_col = st.columns(2)
+    with date_col:
+        selected_date = st.date_input("Attendance date", datetime.date.today())
+    with section_col:
+        section = st.selectbox("Section", ["A", "B"])
+    date_str = selected_date.isoformat()
+    month_str = selected_date.strftime("%Y-%m")
+
+    section_students = students[students["section"] == section].copy()
+    existing = attendance[(attendance["date"] == date_str) & (attendance["section"] == section)]
+    if not existing.empty:
+        st.info(f"This sheet has {len(existing)} saved row(s). Use the editor to make changes; each save is recorded in Faculty Activity.")
+
+    if not section_students.empty:
+        status_by_reg = dict(zip(existing["reg_no"].astype(str), existing["status"]))
+        student_rows = [
+            {"Reg No": str(row["reg_no"]), "Name": row["name"], "Status": status_by_reg.get(str(row["reg_no"]), "Present")}
+            for _, row in section_students.sort_values("reg_no").iterrows()
+        ]
+        known_regs = set(section_students["reg_no"].astype(str))
+        for _, row in existing.iterrows():
+            if str(row["reg_no"]) not in known_regs:
+                student_rows.append({"Reg No": str(row["reg_no"]), "Name": row["name"], "Status": row["status"]})
+    else:
+        student_rows = [
+            {"Reg No": str(row["reg_no"]), "Name": row["name"], "Status": row["status"]}
+            for _, row in existing.iterrows()
+        ]
+
+    st.caption("Edit registration number, name, or status. Add rows for students not yet on the roster; remove a row to omit it from this date's sheet.")
+    edited = st.data_editor(
+        pd.DataFrame(student_rows, columns=["Reg No", "Name", "Status"]),
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key=f"attendance_{date_str}_{section}",
+        column_config={
+            "Reg No": st.column_config.TextColumn("Registration number", required=True),
+            "Name": st.column_config.TextColumn("Student name", required=True),
+            "Status": st.column_config.SelectboxColumn("Status", options=["Present", "Absent"], required=True),
+        },
+    )
+    if st.button("Save attendance", type="primary", use_container_width=True):
+        clean = edited.copy().fillna("")
+        clean["Reg No"] = clean["Reg No"].astype(str).str.strip()
+        clean["Name"] = clean["Name"].astype(str).str.strip()
+        clean["Status"] = clean["Status"].astype(str).str.strip().str.title()
+        clean = clean[(clean["Reg No"] != "") | (clean["Name"] != "")]
+        if (clean["Reg No"] == "").any() or (clean["Name"] == "").any():
+            st.error("Each row needs both a registration number and student name.")
+        elif clean["Reg No"].duplicated().any():
+            st.error("Registration numbers must be unique on this attendance sheet.")
+        elif not clean["Status"].isin(["Present", "Absent"]).all():
+            st.error("Status must be Present or Absent.")
+        else:
+            records = pd.DataFrame({
+                "date": date_str, "month": month_str,
+                "reg_no": clean["Reg No"], "name": clean["Name"],
+                "section": section, "status": clean["Status"],
+                "marked_by": faculty_id, "timestamp": "",
+            })
+            save_attendance(records, date_str, section, faculty_id)
+
+            # Keep newly entered students available for reports and later attendance sheets.
+            roster = load_students()
+            known = set(roster["reg_no"].astype(str))
+            additions = clean[~clean["Reg No"].isin(known)]
+            if not additions.empty:
+                append_rows = pd.DataFrame({
+                    "sno": range(len(roster) + 1, len(roster) + len(additions) + 1),
+                    "reg_no": additions["Reg No"].tolist(), "name": additions["Name"].tolist(),
+                    "course": "MCA", "section": section,
+                })
+                combined = pd.concat([roster, append_rows], ignore_index=True)[ROSTER_COLUMNS]
+                combined.to_csv(STUDENTS_FILE, index=False)
+                now = datetime.datetime.now(APP_TIMEZONE).isoformat(timespec="seconds")
+                append_audit([{
+                    "timestamp": now, "faculty_id": faculty_id, "action": "Student added from attendance",
+                    "date": date_str, "section": section, "reg_no": row["Reg No"],
+                    "student_name": row["Name"], "old_value": "Not on roster",
+                    "new_value": "Added to roster from attendance sheet",
+                } for _, row in additions.iterrows()])
+            st.success("Attendance saved. Faculty edits are visible in the Faculty Activity tab.")
+            st.rerun()
+
+
+def main():
+    if not login_gate():
+        return
+
+    faculty_id = st.session_state["faculty_id"]
+    students = load_students()
+    attendance = load_attendance()
+    audit = load_audit()
+
+    with st.sidebar:
+        st.title("Faculty Portal")
+        st.write(f"Signed in as **{faculty_id}**")
+        if st.button("Sign out", use_container_width=True):
+            del st.session_state["faculty_id"]
+            st.rerun()
+        st.divider()
+        st.metric("Students on roster", len(students))
+        st.metric("Attendance entries", len(attendance))
+        st.metric("Faculty activity entries", len(audit))
+        if not audit.empty:
+            st.caption(f"Latest activity: {audit.iloc[-1]['faculty_id']} · {audit.iloc[-1]['action']}")
+        if st.button("Refresh data", use_container_width=True):
+            st.rerun()
+
+    st.title("MCA Attendance Hub")
+    attendance_tab, reports_tab, chatbot_tab, roster_tab, activity_tab = st.tabs([
+        "Daily Attendance", "Monthly Reports", "Attendance Chatbot", "Manage Roster", "Faculty Activity",
+    ])
+
+    with attendance_tab:
+        render_attendance_editor(students, attendance, faculty_id)
+
+    with reports_tab:
+        st.subheader("Monthly absentees and attendance analysis")
+        if attendance.empty:
             st.info("No attendance records to analyze yet.")
         else:
-            # Month Filter
-            available_months = sorted(att_df["date"].apply(lambda d: str(d)[:7]).unique().tolist(), reverse=True)
-            chosen_month = st.selectbox("Select Month", available_months)
-            
-            month_df = att_df[att_df["date"].str.startswith(chosen_month)]
-            abs_month = month_df[month_df["status"] == "Absent"]
-
-            # Key KPI Cards
-            working_days = month_df["date"].nunique()
-            total_absences = len(abs_month)
-            unique_absentees = abs_month["reg_no"].nunique()
-            
-            kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric("Working Days Recorded", working_days)
-            kpi2.metric("Total Absences", total_absences)
-            kpi3.metric("Distinct Students Absent", unique_absentees)
-
-            st.markdown("---")
-
-            # Chart: Daily absentee trend
-            st.write(f"### Absentees Count per Day ({chosen_month})")
-            daily_abs = abs_month.groupby("date").size().reset_index(name="Absentees")
-            if not daily_abs.empty:
-                st.bar_chart(daily_abs.set_index("date"))
+            months = sorted(attendance["date"].astype(str).str[:7].unique(), reverse=True)
+            month = st.selectbox("Select month", months)
+            month_data = attendance[attendance["date"].astype(str).str.startswith(month)]
+            absences = month_data[month_data["status"] == "Absent"]
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Recorded class days", month_data["date"].nunique())
+            k2.metric("Absence entries", len(absences))
+            k3.metric("Students absent", absences["reg_no"].nunique())
+            daily = absences.groupby("date").size().rename("Absentees")
+            st.subheader("Absentees by day")
+            if daily.empty:
+                st.info("No absences were recorded this month.")
             else:
-                st.write("No absentees in this month!")
+                st.bar_chart(daily)
 
-            # Detailed table by student
-            st.write("### Student-Wise Attendance Percentage")
-            # Aggregated metrics per student in this month
             summary = []
-            for _, s in students_df.iterrows():
-                st_data = month_df[month_df["reg_no"] == s["reg_no"]]
-                if not st_data.empty:
-                    presents = len(st_data[st_data["status"] == "Present"])
-                    absents = len(st_data[st_data["status"] == "Absent"])
-                    total = presents + absents
-                    pct = (presents / total * 100) if total > 0 else 100
+            for _, student in students.iterrows():
+                records = month_data[month_data["reg_no"].astype(str) == str(student["reg_no"])]
+                if not records.empty:
+                    present = int((records["status"] == "Present").sum())
+                    absent = int((records["status"] == "Absent").sum())
+                    total = present + absent
                     summary.append({
-                        "Reg No": s["reg_no"],
-                        "Name": s["name"],
-                        "Section": s["section"],
-                        "Present Days": presents,
-                        "Absent Days": absents,
-                        "Total Days": total,
-                        "Attendance %": round(pct, 1)
+                        "Reg No": student["reg_no"], "Name": student["name"], "Section": student["section"],
+                        "Present Days": present, "Absent Days": absent, "Total Days": total,
+                        "Attendance %": round(present / total * 100, 1) if total else 0,
                     })
             if summary:
-                sum_df = pd.DataFrame(summary).sort_values(by="Absent Days", ascending=False)
-                st.dataframe(
-                    sum_df,
-                    column_config={
-                        "Attendance %": st.column_config.ProgressColumn(
-                            "Attendance %",
-                            format="%.1f%%",
-                            min_value=0,
-                            max_value=100
-                        )
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-
-                # CSV Download Button
+                summary_df = pd.DataFrame(summary).sort_values("Absent Days", ascending=False)
+                st.subheader("Student-wise attendance")
+                st.dataframe(summary_df, hide_index=True, use_container_width=True)
                 csv_buffer = io.StringIO()
-                sum_df.to_csv(csv_buffer, index=False)
+                summary_df.to_csv(csv_buffer, index=False)
                 st.download_button(
-                    label="📥 Download Monthly Report CSV",
-                    data=csv_buffer.getvalue(),
-                    file_name=f"mca_attendance_report_{chosen_month}.csv",
-                    mime="text/csv"
+                    "Download monthly report CSV", csv_buffer.getvalue(),
+                    file_name=f"mca_attendance_report_{month}.csv", mime="text/csv",
                 )
 
-    # ---------------- TAB 3: CHATBOT ----------------
-    with tab_chat:
-        st.subheader("💬 Lightweight Attendance Assistant")
-        st.caption("Ask queries in natural language about student attendance, absentees, or shortage.")
-
-        with st.expander("🔑 Optional: Add Gemini API Key for Advanced Semantic Reasoning"):
-            api_key = st.text_input("Gemini API Key", type="password", help="Leave blank to use fast built-in rule matching engine.")
-
-        # Chat history
+    with chatbot_tab:
+        st.subheader("Attendance Chatbot")
+        st.caption("Ask about a student's record, absentees, attendance percentages, or a date. Answers use saved app data only.")
+        prompts = ["Who was absent yesterday?", "Show Section A absentees for 2026-10-31", "Who is below 75% attendance?", "Attendance of RTC2026MCA024"]
+        st.caption("Examples: " + " · ".join(prompts))
         if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
-
-        # Display history
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        user_input = st.chat_input("Ask a question (e.g. 'Who is absent today?', 'Attendance of Adheeswaran', 'Students below 75%')...")
+            st.session_state["chat_history"] = []
+        if st.button("Clear chat"):
+            st.session_state["chat_history"] = []
+            st.rerun()
+        for message in st.session_state["chat_history"]:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        user_input = st.chat_input("Ask an attendance question…")
         if user_input:
-            st.session_state.chat_history.append({"role": "user", "content": user_input})
-            with st.chat_message("user"):
-                st.markdown(user_input)
+            answer = query_assistant(user_input, attendance, students)
+            st.session_state["chat_history"].extend([
+                {"role": "user", "content": user_input},
+                {"role": "assistant", "content": answer},
+            ])
+            st.rerun()
 
-            # Generate reply
-            answer = query_assistant(user_input, att_df, students_df, api_key=api_key if api_key else None)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-
-    # ---------------- TAB 4: MANAGE ROSTER ----------------
-    with tab_manage:
-        st.subheader("Student Roster Management")
-        st.write(f"Currently managing **{len(students_df)}** students across sections A and B.")
-        st.dataframe(students_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.write("### Upload Updated Roster CSV")
-        st.caption("Upload raw or updated CSV sheet with student details. Empty rows and trailing commas will be auto-cleaned.")
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
-        if uploaded is not None:
-            content = uploaded.getvalue().decode("utf-8", errors="ignore")
-            parsed_df = parse_flexible_csv(content)
-            if not parsed_df.empty:
-                parsed_df.to_csv(STUDENTS_FILE, index=False)
-                st.success(f"Successfully loaded and saved {len(parsed_df)} students!")
-                st.cache_data.clear()
-                st.rerun()
+    with roster_tab:
+        st.subheader("Student roster")
+        st.caption("Edit existing details or add rows. Save records the faculty ID and before/after values in Faculty Activity.")
+        roster_view = students.copy()
+        roster_view.columns = ["S.No", "Reg No", "Name", "Course", "Section"]
+        edited_roster = st.data_editor(
+            roster_view,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key="roster_editor",
+            column_config={
+                "S.No": st.column_config.TextColumn("S.No", disabled=True),
+                "Reg No": st.column_config.TextColumn("Reg No", required=True),
+                "Name": st.column_config.TextColumn("Name", required=True),
+                "Course": st.column_config.TextColumn("Course"),
+                "Section": st.column_config.SelectboxColumn("Section", options=["A", "B"], required=True),
+            },
+        )
+        if st.button("Save roster changes", type="primary"):
+            candidate = edited_roster.copy()
+            candidate.columns = ROSTER_COLUMNS
+            error = save_roster(candidate, faculty_id)
+            if error:
+                st.error(error)
             else:
-                st.error("Could not parse student entries. Ensure Registration Numbers start with RTC2026.")
+                st.success("Roster saved. Changes are listed in Faculty Activity.")
+                st.rerun()
+
+        st.markdown("#### Import roster CSV")
+        uploaded = st.file_uploader("Choose a CSV roster", type=["csv"], key="roster_upload")
+        if uploaded is not None:
+            parsed = parse_flexible_csv(uploaded.getvalue().decode("utf-8-sig", errors="ignore"))
+            if parsed.empty:
+                try:
+                    parsed = pd.read_csv(io.BytesIO(uploaded.getvalue()), dtype={"reg_no": str})
+                    parsed.columns = [str(column).strip().lower() for column in parsed.columns]
+                    parsed = parsed.rename(columns={"registration number": "reg_no", "student name": "name"})
+                    for col in ROSTER_COLUMNS:
+                        if col not in parsed.columns:
+                            parsed[col] = "" if col != "sno" else range(1, len(parsed) + 1)
+                    parsed = parsed[ROSTER_COLUMNS]
+                except Exception:
+                    parsed = pd.DataFrame(columns=ROSTER_COLUMNS)
+            st.dataframe(parsed, hide_index=True, use_container_width=True)
+            if st.button("Save uploaded roster", key="save_upload"):
+                error = save_roster(parsed, faculty_id)
+                if error:
+                    st.error(error)
+                else:
+                    st.success("Uploaded roster saved and logged.")
+                    st.rerun()
+
+    with activity_tab:
+        st.subheader("Faculty activity history")
+        st.caption("Attendance status changes, roster additions, edits, and removals are recorded with faculty ID and timestamp.")
+        if audit.empty:
+            st.info("No faculty changes have been recorded yet.")
+        else:
+            filters = st.columns(3)
+            faculty_filter = filters[0].selectbox("Faculty", ["All"] + sorted(audit["faculty_id"].astype(str).unique().tolist()))
+            action_filter = filters[1].selectbox("Action", ["All"] + sorted(audit["action"].astype(str).unique().tolist()))
+            section_filter = filters[2].selectbox("Section", ["All", "A", "B"])
+            visible = audit.copy()
+            if faculty_filter != "All":
+                visible = visible[visible["faculty_id"] == faculty_filter]
+            if action_filter != "All":
+                visible = visible[visible["action"] == action_filter]
+            if section_filter != "All":
+                visible = visible[visible["section"] == section_filter]
+            st.dataframe(visible.iloc[::-1], hide_index=True, use_container_width=True)
+            st.download_button(
+                "Download activity CSV", visible.to_csv(index=False),
+                file_name="faculty_activity.csv", mime="text/csv",
+            )
 
 
 if __name__ == "__main__":
