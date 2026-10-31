@@ -21,7 +21,7 @@ ATTENDANCE_COLUMNS = [
     "date", "month", "reg_no", "name", "section", "status", "marked_by", "timestamp"
 ]
 ROSTER_COLUMNS = ["sno", "reg_no", "name", "course", "section"]
-FACULTY_IDS = [f"Faculty-{i}" for i in range(1, 11)]
+FACULTY_IDS = [f"faculty_{i}" for i in range(1, 11)]
 APP_TIMEZONE = datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
 
 st.set_page_config(
@@ -65,16 +65,17 @@ def login_gate() -> bool:
 
     if st.session_state.get("faculty_id") not in FACULTY_IDS:
         st.title("MCA Attendance Hub")
-        st.caption("Sign in with your faculty ID. Faculty IDs share the password configured by the administrator.")
+        st.caption("Sign in with your faculty username. All ten faculty usernames use the same shared password.")
         with st.form("faculty_login"):
-            faculty_id = st.selectbox("Faculty ID", FACULTY_IDS)
+            faculty_id = st.text_input("Username", placeholder="faculty_1")
             entered_password = st.text_input("Shared password", type="password")
             submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
         if submitted:
-            if hmac.compare_digest(entered_password, password):
-                st.session_state["faculty_id"] = faculty_id
+            normalized_id = faculty_id.strip().lower()
+            if normalized_id in FACULTY_IDS and hmac.compare_digest(entered_password, password):
+                st.session_state["faculty_id"] = normalized_id
                 st.rerun()
-            st.error("The password did not match. Please try again.")
+            st.error("Enter a valid username (faculty_1 through faculty_10) and the shared password.")
         return False
     return True
 
